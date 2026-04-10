@@ -1,0 +1,14 @@
+node_modules
+
+# Environment variables / local secrets
+.env
+.env.*
+!.env.example
+
+# Local databases and sqlite artifacts
+*.sqlite
+*.sqlite-journal
+*.db
+
+# Prisma local dev DB (template default)
+prisma/dev.sqlite

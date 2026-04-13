@@ -13,6 +13,12 @@ const SHOP_METAFIELD_KEYS = {
 const PRODUCTS_PAGE_SIZE = 50;
 const UPDATE_BATCH_SIZE = 25;
 const BATCH_DELAY_MS = 250;
+const DEBUG_PRICING = process.env.DEBUG_PRICING === "true";
+
+function pricingLog(label, data) {
+  if (!DEBUG_PRICING) return;
+  console.log(`[pricing] ${label}`, JSON.stringify(data, null, 2));
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -313,13 +319,47 @@ export async function recalculateAllProductPrices(admin, rates) {
           const weight = Number(node.weight?.value);
           const makingCharges = Number(node.makingCharges?.value);
 
-          if (
-            !metalType ||
-            !Number.isFinite(weight) ||
-            weight <= 0 ||
-            !Number.isFinite(makingCharges) ||
-            makingCharges < 0
-          ) {
+          pricingLog("product_input", {
+            productId: node.id,
+            title: node.title,
+            raw: {
+              metalType: node.metalType?.value ?? null,
+              weight: node.weight?.value ?? null,
+              makingCharges: node.makingCharges?.value ?? null,
+            },
+            parsed: {
+              metalType,
+              weight,
+              makingCharges,
+            },
+            rates: numericRates,
+          });
+
+          if (!metalType) {
+            pricingLog("skip_missing_metal_type", {
+              productId: node.id,
+              title: node.title,
+            });
+            return { status: "skipped" };
+          }
+
+          if (!Number.isFinite(weight) || weight <= 0) {
+            pricingLog("skip_invalid_weight", {
+              productId: node.id,
+              title: node.title,
+              rawWeight: node.weight?.value ?? null,
+              parsedWeight: weight,
+            });
+            return { status: "skipped" };
+          }
+
+          if (!Number.isFinite(makingCharges) || makingCharges < 0) {
+            pricingLog("skip_invalid_making_charges", {
+              productId: node.id,
+              title: node.title,
+              rawMakingCharges: node.makingCharges?.value ?? null,
+              parsedMakingCharges: makingCharges,
+            });
             return { status: "skipped" };
           }
 
@@ -331,6 +371,13 @@ export async function recalculateAllProductPrices(admin, rates) {
           });
 
           if (calculatedPrice === null) {
+            pricingLog("skip_unknown_metal_type", {
+              productId: node.id,
+              title: node.title,
+              metalType,
+              normalizedType: String(metalType || "").toLowerCase(),
+              expected: ["gold", "silver"],
+            });
             return { status: "skipped" };
           }
 
@@ -345,11 +392,23 @@ export async function recalculateAllProductPrices(admin, rates) {
           );
 
           if (!updateResult.success) {
+            pricingLog("update_failed", {
+              productId: node.id,
+              title: node.title,
+              reason: updateResult.reason,
+            });
             return {
               status: "failed",
               message: `${node.title}: ${updateResult.reason}`,
             };
           }
+
+          pricingLog("updated", {
+            productId: node.id,
+            title: node.title,
+            variantCount: variantUpdates.length,
+            calculatedPrice,
+          });
 
           return { status: "updated" };
         }),

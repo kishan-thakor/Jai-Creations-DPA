@@ -2,7 +2,7 @@
 
 client_id = "6735022651772caf2a5fd4b01857b4f9"
 name = "dynamic-pricing-app"
-application_url = "https://example.com"
+application_url = "https://sincere-sharita-inscribable.ngrok-free.dev"
 embedded = true
 
 [build]
@@ -13,19 +13,23 @@ include_config_on_deploy = true
 api_version = "2026-04"
 
   [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled"
-
-  [[webhooks.subscriptions]]
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_metaobject_definitions,write_metaobjects,write_products"
+scopes = "write_metaobject_definitions,read_metaobjects,write_metaobjects,read_products,write_products"
+optional_scopes = [ ]
+use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [
+  "https://sincere-sharita-inscribable.ngrok-free.dev/api/auth/callback"
+]
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"

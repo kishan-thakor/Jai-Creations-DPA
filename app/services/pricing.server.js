@@ -162,15 +162,6 @@ export async function saveShopPricingRates(admin, rates) {
   }
 }
 
-function buildVariantUpdates(variantEdges, price) {
-  const formattedPrice = price.toFixed(2);
-  // Assumption: all variants under a product should share the same metal pricing outcome.
-  return variantEdges.map((edge) => ({
-    id: edge.node.id,
-    price: formattedPrice,
-  }));
-}
-
 function calculateFinalPrice({ metalType, weight, makingCharges, rates }) {
   const normalizedType = String(metalType || "").toLowerCase();
   const metalRate =
@@ -204,20 +195,21 @@ async function fetchProductPage(admin, afterCursor) {
                 edges {
                   node {
                     id
+                    title
+                    metalType: metafield(namespace: "${ns}", key: "metal_type") {
+                      value
+                    }
+                    weight: metafield(namespace: "${ns}", key: "weight") {
+                      value
+                    }
+                    makingCharges: metafield(
+                      namespace: "${ns}"
+                      key: "making_charges"
+                    ) {
+                      value
+                    }
                   }
                 }
-              }
-              metalType: metafield(namespace: "${ns}", key: "metal_type") {
-                value
-              }
-              weight: metafield(namespace: "${ns}", key: "weight") {
-                value
-              }
-              makingCharges: metafield(
-                namespace: "${ns}"
-                key: "making_charges"
-              ) {
-                value
               }
             }
           }
@@ -315,76 +307,108 @@ export async function recalculateAllProductPrices(admin, rates) {
         batch.map(async ({ node }) => {
           processed += 1;
 
-          const metalType = node.metalType?.value ?? "";
-          const weight = Number(node.weight?.value);
-          const makingCharges = Number(node.makingCharges?.value);
-
           pricingLog("product_input", {
             productId: node.id,
             title: node.title,
-            raw: {
-              metalType: node.metalType?.value ?? null,
-              weight: node.weight?.value ?? null,
-              makingCharges: node.makingCharges?.value ?? null,
-            },
-            parsed: {
+            variantCount: node.variants?.edges?.length ?? 0,
+            rates: numericRates,
+          });
+
+          const variantEdges = node.variants?.edges ?? [];
+          const variantUpdates = [];
+
+          for (const edge of variantEdges) {
+            const variantNode = edge.node;
+            const metalType = variantNode.metalType?.value ?? "";
+            const weight = Number(variantNode.weight?.value);
+            const makingCharges = Number(variantNode.makingCharges?.value);
+
+            pricingLog("variant_input", {
+              productId: node.id,
+              productTitle: node.title,
+              variantId: variantNode.id,
+              variantTitle: variantNode.title ?? "",
+              raw: {
+                metalType: variantNode.metalType?.value ?? null,
+                weight: variantNode.weight?.value ?? null,
+                makingCharges: variantNode.makingCharges?.value ?? null,
+              },
+              parsed: {
+                metalType,
+                weight,
+                makingCharges,
+              },
+            });
+
+            if (!metalType) {
+              pricingLog("skip_variant_missing_metal_type", {
+                productId: node.id,
+                productTitle: node.title,
+                variantId: variantNode.id,
+                variantTitle: variantNode.title ?? "",
+              });
+              continue;
+            }
+
+            if (!Number.isFinite(weight) || weight <= 0) {
+              pricingLog("skip_variant_invalid_weight", {
+                productId: node.id,
+                productTitle: node.title,
+                variantId: variantNode.id,
+                variantTitle: variantNode.title ?? "",
+                rawWeight: variantNode.weight?.value ?? null,
+                parsedWeight: weight,
+              });
+              continue;
+            }
+
+            if (!Number.isFinite(makingCharges) || makingCharges < 0) {
+              pricingLog("skip_variant_invalid_making_charges", {
+                productId: node.id,
+                productTitle: node.title,
+                variantId: variantNode.id,
+                variantTitle: variantNode.title ?? "",
+                rawMakingCharges: variantNode.makingCharges?.value ?? null,
+                parsedMakingCharges: makingCharges,
+              });
+              continue;
+            }
+
+            const calculatedPrice = calculateFinalPrice({
               metalType,
               weight,
               makingCharges,
-            },
-            rates: numericRates,
-          });
+              rates: numericRates,
+            });
 
-          if (!metalType) {
-            pricingLog("skip_missing_metal_type", {
+            if (calculatedPrice === null) {
+              pricingLog("skip_variant_unknown_metal_type", {
+                productId: node.id,
+                productTitle: node.title,
+                variantId: variantNode.id,
+                variantTitle: variantNode.title ?? "",
+                metalType,
+                normalizedType: String(metalType || "").toLowerCase(),
+                expected: ["gold", "silver"],
+              });
+              continue;
+            }
+
+            variantUpdates.push({
+              id: variantNode.id,
+              price: calculatedPrice.toFixed(2),
+            });
+          }
+
+          if (variantUpdates.length === 0) {
+            pricingLog("skip_product_no_valid_variants", {
               productId: node.id,
-              title: node.title,
+              productTitle: node.title,
+              variantCount: variantEdges.length,
             });
             return { status: "skipped" };
           }
 
-          if (!Number.isFinite(weight) || weight <= 0) {
-            pricingLog("skip_invalid_weight", {
-              productId: node.id,
-              title: node.title,
-              rawWeight: node.weight?.value ?? null,
-              parsedWeight: weight,
-            });
-            return { status: "skipped" };
-          }
-
-          if (!Number.isFinite(makingCharges) || makingCharges < 0) {
-            pricingLog("skip_invalid_making_charges", {
-              productId: node.id,
-              title: node.title,
-              rawMakingCharges: node.makingCharges?.value ?? null,
-              parsedMakingCharges: makingCharges,
-            });
-            return { status: "skipped" };
-          }
-
-          const calculatedPrice = calculateFinalPrice({
-            metalType,
-            weight,
-            makingCharges,
-            rates: numericRates,
-          });
-
-          if (calculatedPrice === null) {
-            pricingLog("skip_unknown_metal_type", {
-              productId: node.id,
-              title: node.title,
-              metalType,
-              normalizedType: String(metalType || "").toLowerCase(),
-              expected: ["gold", "silver"],
-            });
-            return { status: "skipped" };
-          }
-
-          const variantUpdates = buildVariantUpdates(
-            node.variants?.edges ?? [],
-            calculatedPrice,
-          );
           const updateResult = await updateProductVariantsPrice(
             admin,
             node.id,
@@ -407,7 +431,6 @@ export async function recalculateAllProductPrices(admin, rates) {
             productId: node.id,
             title: node.title,
             variantCount: variantUpdates.length,
-            calculatedPrice,
           });
 
           return { status: "updated" };

@@ -2,7 +2,7 @@
 
 client_id = "6735022651772caf2a5fd4b01857b4f9"
 name = "dynamic-pricing-app"
-application_url = "https://sincere-sharita-inscribable.ngrok-free.dev"
+application_url = "https://app.jaicreations.com"
 embedded = true
 
 [build]
@@ -28,7 +28,7 @@ use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [
-  "https://sincere-sharita-inscribable.ngrok-free.dev/api/auth/callback"
+  "https://app.jaicreations.com/api/auth/callback"
 ]
 
 [product.metafields.app.demo_info]

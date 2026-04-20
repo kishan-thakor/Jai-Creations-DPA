@@ -15,7 +15,6 @@ const SHOP_METAFIELD_KEYS = {
 const PRODUCTS_PAGE_SIZE = 50;
 const UPDATE_BATCH_SIZE = 25;
 const BATCH_DELAY_MS = 250;
-const DEBUG_PRICING = process.env.DEBUG_PRICING === "true";
 
 /** @param {string} requestId */
 export function trace(requestId, tag, message, data) {
@@ -33,9 +32,35 @@ export function traceError(requestId, message, data) {
 
 export { createPricingRequestId };
 
-function pricingLog(label, data) {
-  if (!DEBUG_PRICING) return;
-  console.log(`[pricing] ${label}`, JSON.stringify(data, null, 2));
+/** @param {string} requestId */
+function logShopMetafields(requestId, payload) {
+  console.log("[SHOP_METAFIELDS]", JSON.stringify({ requestId, ...payload }));
+}
+
+/**
+ * @param {string} requestId
+ * @param {string} skipReason
+ * @param {Record<string, unknown>} detail
+ */
+function logSkip(requestId, skipReason, detail) {
+  console.log(
+    "[SKIP]",
+    JSON.stringify({
+      requestId,
+      skipReason,
+      metafieldNamespace: PRODUCT_METAFIELD_NAMESPACE,
+      ...detail,
+    }),
+  );
+}
+
+/** @param {{ metalType?: { value?: string } | null, weight?: { value?: string } | null, makingCharges?: { value?: string } | null }} variantNode */
+function variantMetafieldsFromShopify(variantNode) {
+  return {
+    metal_type: variantNode.metalType?.value ?? null,
+    weight: variantNode.weight?.value ?? null,
+    making_charges: variantNode.makingCharges?.value ?? null,
+  };
 }
 
 function sleep(ms) {
@@ -83,8 +108,7 @@ export function validatePricingInput(input) {
   };
 }
 
-export async function fetchShopPricingRates(admin, options = {}) {
-  const requestId = options.requestId;
+export async function fetchShopPricingRates(admin) {
   const response = await admin.graphql(
     `#graphql
       query getShopPricingRates {
@@ -105,19 +129,9 @@ export async function fetchShopPricingRates(admin, options = {}) {
   );
 
   const responseJson = await response.json();
-  if (requestId) {
-    logGraphqlErrors(requestId, "fetchShopPricingRates", responseJson);
-  }
-
   const shop = responseJson?.data?.shop;
 
   if (!shop?.id) {
-    if (requestId) {
-      traceError(requestId, "Unable to fetch shop details for pricing", {
-        step: "fetchShopPricingRates",
-        responseJson,
-      });
-    }
     throw new Error("Unable to fetch shop details for pricing.");
   }
 
@@ -131,51 +145,16 @@ export async function fetchShopPricingRates(admin, options = {}) {
   };
 }
 
-/**
- * @param {string} requestId
- * @param {unknown} responseJson
- */
-function logGraphqlErrors(requestId, context, responseJson) {
-  const errors = responseJson?.errors;
-  if (Array.isArray(errors) && errors.length > 0) {
-    traceError(requestId, `GraphQL errors (${context})`, {
-      step: context,
-      errors,
-    });
-  }
-}
-
 export async function saveShopPricingRates(admin, rates, options = {}) {
   const requestId = options.requestId ?? createPricingRequestId();
 
-  trace(requestId, "DATA", "saveShopPricingRates: fetching shop pricing metafields", {
-    source: "Shopify Admin GraphQL (shop metafields, namespace pricing)",
-  });
+  const { shopId, rates: existingRates } = await fetchShopPricingRates(admin);
 
-  const { shopId, rates: existingRates } = await fetchShopPricingRates(admin, {
-    requestId,
-  });
-
-  const fetched = {
-    goldRate: existingRates.goldRate === "" ? null : existingRates.goldRate,
-    silverRate: existingRates.silverRate === "" ? null : existingRates.silverRate,
+  const beforeSave = {
+    gold_rate: existingRates.goldRate === "" ? null : existingRates.goldRate,
+    silver_rate: existingRates.silverRate === "" ? null : existingRates.silverRate,
     gst: existingRates.gst === "" ? null : existingRates.gst,
   };
-  trace(requestId, "DATA", "Fetched existing shop rate metafields (before save)", {
-    fetched,
-  });
-  if (
-    fetched.goldRate == null &&
-    fetched.silverRate == null &&
-    fetched.gst == null
-  ) {
-    trace(
-      requestId,
-      "DATA",
-      "NOTE: all pricing metafields were empty on shop (first save or unset)",
-      {},
-    );
-  }
 
   const metafields = [
     {
@@ -201,14 +180,6 @@ export async function saveShopPricingRates(admin, rates, options = {}) {
     },
   ];
 
-  trace(requestId, "DATA", "Writing validated rates to shop metafields (metafieldsSet)", {
-    payload: {
-      goldRate: rates.goldRate,
-      silverRate: rates.silverRate,
-      gst: rates.gst,
-    },
-  });
-
   const response = await admin.graphql(
     `#graphql
       mutation setPricingMetafields($metafields: [MetafieldsSetInput!]!) {
@@ -230,16 +201,18 @@ export async function saveShopPricingRates(admin, rates, options = {}) {
   );
 
   const responseJson = await response.json();
-  logGraphqlErrors(requestId, "metafieldsSet", responseJson);
-
   const userErrors = responseJson?.data?.metafieldsSet?.userErrors ?? [];
 
   if (userErrors.length > 0) {
-    traceError(requestId, "saveShopPricingRates: metafieldsSet userErrors", {
-      step: "saveShopPricingRates",
-      userErrors,
-      responseJson,
-    });
+    console.error(
+      "[SHOP_METAFIELDS]",
+      JSON.stringify({
+        requestId,
+        error: "metafieldsSet failed",
+        userErrors,
+        responseJson,
+      }),
+    );
     throw new Error(
       `Failed to save pricing rates: ${userErrors
         .map((error) => error.message)
@@ -247,8 +220,18 @@ export async function saveShopPricingRates(admin, rates, options = {}) {
     );
   }
 
-  trace(requestId, "DATA", "Shop pricing metafields saved successfully", {
-    metafields: responseJson?.data?.metafieldsSet?.metafields ?? [],
+  const savedMetafields =
+    responseJson?.data?.metafieldsSet?.metafields ?? [];
+
+  logShopMetafields(requestId, {
+    shopMetafieldNamespace: SHOP_PRICING_NAMESPACE,
+    beforeSaveFromShopify: beforeSave,
+    afterSaveWritten: {
+      gold_rate: rates.goldRate,
+      silver_rate: rates.silverRate,
+      gst: rates.gst,
+    },
+    shopifyReturnedMetafields: savedMetafields,
   });
 }
 
@@ -351,11 +334,6 @@ async function updateProductVariantsPrice(
     return { success: false, reason: "NO_VARIANTS" };
   }
 
-  trace(requestId, "UPDATE", "productVariantsBulkUpdate (request)", {
-    productId,
-    variantUpdates: variantUpdates.map((v) => ({ id: v.id, price: v.price })),
-  });
-
   const response = await admin.graphql(
     `#graphql
       mutation updateProductVariantPrices(
@@ -382,30 +360,25 @@ async function updateProductVariantsPrice(
   );
 
   const responseJson = await response.json();
-  logGraphqlErrors(requestId, "productVariantsBulkUpdate", responseJson);
-
   const userErrors =
     responseJson?.data?.productVariantsBulkUpdate?.userErrors ?? [];
 
   if (userErrors.length > 0) {
-    traceError(requestId, "productVariantsBulkUpdate failed", {
-      step: "updateProductVariantsPrice",
-      productId,
-      userErrors,
-      responseJson,
-    });
+    console.error(
+      "[PRICING_UPDATE_FAILED]",
+      JSON.stringify({
+        requestId,
+        productId,
+        userErrors,
+        responseJson,
+      }),
+    );
     return {
       success: false,
       reason: userErrors.map((error) => error.message).join(", "),
       responseJson,
     };
   }
-
-  trace(requestId, "UPDATE", "productVariantsBulkUpdate (success)", {
-    productId,
-    returnedProductId:
-      responseJson?.data?.productVariantsBulkUpdate?.product?.id ?? null,
-  });
 
   return { success: true };
 }
@@ -419,21 +392,21 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
     gst: Number(rates.gst),
   };
 
-  trace(requestId, "DATA", "Recalculation rates source: validated request payload (not re-read from metafields)", {
-    goldRate: numericRates.goldRate,
-    silverRate: numericRates.silverRate,
-    gst: numericRates.gst,
-  });
-
   if (
     !Number.isFinite(numericRates.goldRate) ||
     !Number.isFinite(numericRates.silverRate) ||
     !Number.isFinite(numericRates.gst)
   ) {
-    traceError(requestId, "Invalid numeric rates after coercion", {
-      step: "recalculateAllProductPrices",
-      numericRates,
-    });
+    console.error(
+      "[SKIP]",
+      JSON.stringify({
+        requestId,
+        skipReason: "INVALID_SHOP_RATES",
+        whySkipped:
+          "Gold, silver, or GST from the form could not be read as finite numbers.",
+        parsedRates: numericRates,
+      }),
+    );
     throw new Error("Invalid pricing rates for recalculation.");
   }
 
@@ -446,40 +419,44 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
   const failures = [];
   let pageIndex = 0;
 
+  const productFromShopify = (node) => ({
+    id: node.id,
+    title: node.title,
+    handle: node.handle,
+  });
+
   try {
     while (hasNextPage) {
       const pageResponse = await fetchProductPage(admin, afterCursor);
-      logGraphqlErrors(requestId, `fetchProductPage page ${pageIndex}`, pageResponse);
-
       const products = pageResponse?.data?.products;
 
       if (!products) {
-        traceError(requestId, "Failed to fetch products for pricing recalculation", {
-          step: "fetchProductPage",
-          pageIndex,
-          afterCursor,
-          responseJson: pageResponse,
-        });
+        console.error(
+          "[SKIP]",
+          JSON.stringify({
+            requestId,
+            skipReason: "PRODUCTS_QUERY_FAILED",
+            whySkipped:
+              "Shopify did not return products data (see responseJson).",
+            pageIndex,
+            afterCursor,
+            responseJson: pageResponse,
+          }),
+        );
         throw new Error("Failed to fetch products for pricing recalculation.");
       }
 
       const productEdges = products.edges ?? [];
 
-      trace(requestId, "PRODUCT", "Product page fetched", {
-        pageIndex,
-        countOnPage: productEdges.length,
-        hasNextPage: Boolean(products.pageInfo?.hasNextPage),
-        sample: productEdges.slice(0, 5).map(({ node }) => ({
-          id: node.id,
-          handle: node.handle,
-          title: node.title,
-        })),
-      });
-
       if (productEdges.length === 0 && pageIndex === 0) {
-        traceError(requestId, "No products returned from Shopify", {
-          step: "fetchProductPage",
-        });
+        console.log(
+          "[SKIP]",
+          JSON.stringify({
+            requestId,
+            skipReason: "NO_PRODUCTS_IN_CATALOG",
+            whySkipped: "Shopify returned zero products on the first page.",
+          }),
+        );
       }
 
       for (
@@ -493,95 +470,66 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
           batch.map(async ({ node }) => {
             processed += 1;
 
-            pricingLog("product_input", {
-              productId: node.id,
-              title: node.title,
-              variantCount: node.variants?.edges?.length ?? 0,
-              rates: numericRates,
-            });
-
-            trace(requestId, "PRODUCT", "Processing product", {
-              productId: node.id,
-              title: node.title,
-              handle: node.handle,
-              variantCount: node.variants?.edges?.length ?? 0,
-            });
-
             const variantEdges = node.variants?.edges ?? [];
             const variantUpdates = [];
+
+            if (variantEdges.length === 0) {
+              logSkip(requestId, "PRODUCT_HAS_NO_VARIANTS", {
+                productFromShopify: productFromShopify(node),
+                whySkipped:
+                  "Product has no variants in Shopify; nothing to price.",
+              });
+              return { status: "skipped" };
+            }
 
             for (const edge of variantEdges) {
               const variantNode = edge.node;
               const metalType = variantNode.metalType?.value ?? "";
               const weight = Number(variantNode.weight?.value);
               const makingCharges = Number(variantNode.makingCharges?.value);
-
-              pricingLog("variant_input", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? "",
-                raw: {
-                  metalType: variantNode.metalType?.value ?? null,
-                  weight: variantNode.weight?.value ?? null,
-                  makingCharges: variantNode.makingCharges?.value ?? null,
-                },
-                parsed: {
-                  metalType,
-                  weight,
-                  makingCharges,
-                },
-              });
+              const metafieldsFromShopify =
+                variantMetafieldsFromShopify(variantNode);
 
               if (!metalType) {
-                trace(requestId, "CALCULATION", "Skipped: No metal type", {
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                });
-                pricingLog("skip_variant_missing_metal_type", {
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                  variantTitle: variantNode.title ?? "",
+                logSkip(requestId, "VARIANT_SKIPPED_NO_METAL_TYPE", {
+                  productFromShopify: productFromShopify(node),
+                  variantFromShopify: {
+                    id: variantNode.id,
+                    title: variantNode.title ?? "",
+                  },
+                  metafieldsFromShopify,
+                  whySkipped:
+                    "custom.metal_type is missing or empty. Expected a value (e.g. gold or silver).",
                 });
                 continue;
               }
 
               if (!Number.isFinite(weight) || weight <= 0) {
-                trace(requestId, "CALCULATION", "Skipped: Missing weight", {
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                  rawWeight: variantNode.weight?.value ?? null,
+                logSkip(requestId, "VARIANT_SKIPPED_INVALID_WEIGHT", {
+                  productFromShopify: productFromShopify(node),
+                  variantFromShopify: {
+                    id: variantNode.id,
+                    title: variantNode.title ?? "",
+                  },
+                  metafieldsFromShopify,
                   parsedWeight: weight,
-                });
-                pricingLog("skip_variant_invalid_weight", {
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                  variantTitle: variantNode.title ?? "",
-                  rawWeight: variantNode.weight?.value ?? null,
-                  parsedWeight: weight,
+                  whySkipped:
+                    "custom.weight must be a positive number; value was missing, non-numeric, or <= 0.",
                 });
                 continue;
               }
 
               if (!Number.isFinite(makingCharges) || makingCharges < 0) {
-                trace(requestId, "CALCULATION", "Skipped: Invalid metafield", {
-                  reason: "making_charges invalid or negative",
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                  rawMakingCharges: variantNode.makingCharges?.value ?? null,
-                });
-                pricingLog("skip_variant_invalid_making_charges", {
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                  variantTitle: variantNode.title ?? "",
-                  rawMakingCharges: variantNode.makingCharges?.value ?? null,
+                logSkip(requestId, "VARIANT_SKIPPED_INVALID_MAKING_CHARGES", {
+                  productFromShopify: productFromShopify(node),
+                  variantFromShopify: {
+                    id: variantNode.id,
+                    title: variantNode.title ?? "",
+                  },
+                  metafieldsFromShopify,
                   parsedMakingCharges: makingCharges,
+                  whySkipped:
+                    "custom.making_charges must be a number >= 0 (use 0 if none); value was missing, non-numeric, or negative.",
                 });
                 continue;
               }
@@ -594,41 +542,20 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
               });
 
               if (calculatedPrice === null) {
-                trace(requestId, "CALCULATION", "Skipped: Invalid metafield", {
-                  detail: "metal_type must be gold or silver",
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                  metalType,
-                });
-                pricingLog("skip_variant_unknown_metal_type", {
-                  productId: node.id,
-                  productTitle: node.title,
-                  variantId: variantNode.id,
-                  variantTitle: variantNode.title ?? "",
-                  metalType,
-                  normalizedType: String(metalType || "").toLowerCase(),
-                  expected: ["gold", "silver"],
+                logSkip(requestId, "VARIANT_SKIPPED_METAL_TYPE_NOT_GOLD_OR_SILVER", {
+                  productFromShopify: productFromShopify(node),
+                  variantFromShopify: {
+                    id: variantNode.id,
+                    title: variantNode.title ?? "",
+                  },
+                  metafieldsFromShopify,
+                  metalTypeRaw: metalType,
+                  normalizedMetalType: String(metalType || "").toLowerCase(),
+                  whySkipped:
+                    'metal_type must normalize to "gold" or "silver" (case-insensitive).',
                 });
                 continue;
               }
-
-              const breakdown = getPriceBreakdown({
-                metalType,
-                weight,
-                makingCharges,
-                rates: numericRates,
-              });
-
-              trace(requestId, "CALCULATION", "Variant priced", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                baseSubtotal: breakdown?.subtotal,
-                appliedFormula: breakdown?.formula,
-                formulaWithValues: breakdown?.formulaWithValues,
-                newPrice: calculatedPrice,
-              });
 
               variantUpdates.push({
                 id: variantNode.id,
@@ -637,16 +564,6 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
             }
 
             if (variantUpdates.length === 0) {
-              trace(requestId, "CALCULATION", "Skipped: No valid variants for product", {
-                productId: node.id,
-                productTitle: node.title,
-                variantCount: variantEdges.length,
-              });
-              pricingLog("skip_product_no_valid_variants", {
-                productId: node.id,
-                productTitle: node.title,
-                variantCount: variantEdges.length,
-              });
               return { status: "skipped" };
             }
 
@@ -658,22 +575,11 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
             );
 
             if (!updateResult.success) {
-              pricingLog("update_failed", {
-                productId: node.id,
-                title: node.title,
-                reason: updateResult.reason,
-              });
               return {
                 status: "failed",
                 message: `${node.title}: ${updateResult.reason}`,
               };
             }
-
-            pricingLog("updated", {
-              productId: node.id,
-              title: node.title,
-              variantCount: variantUpdates.length,
-            });
 
             return { status: "updated" };
           }),
@@ -698,17 +604,6 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
       pageIndex += 1;
     }
 
-    console.log(`[SUMMARY] requestId=${requestId}`);
-    console.log(
-      `Processed: ${processed}\nUpdated: ${updated}\nSkipped: ${skipped}\nFailed: ${failed}`,
-    );
-    trace(requestId, "SUMMARY", "Recalculation complete", {
-      processed,
-      updated,
-      skipped,
-      failed,
-    });
-
     return {
       processed,
       updated,
@@ -718,11 +613,14 @@ export async function recalculateAllProductPrices(admin, rates, options = {}) {
       requestId,
     };
   } catch (error) {
-    traceError(requestId, "recalculateAllProductPrices threw", {
-      step: "recalculateAllProductPrices",
-      message: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    });
+    console.error(
+      "[PRICING]",
+      JSON.stringify({
+        requestId,
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      }),
+    );
     throw error;
   }
 }

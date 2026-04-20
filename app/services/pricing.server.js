@@ -1,3 +1,5 @@
+import { createPricingRequestId } from "../utils/pricingRequestId.js";
+
 const SHOP_PRICING_NAMESPACE = "pricing";
 
 // Product metafields (metal_type, weight, making_charges): must match admin definitions
@@ -14,6 +16,22 @@ const PRODUCTS_PAGE_SIZE = 50;
 const UPDATE_BATCH_SIZE = 25;
 const BATCH_DELAY_MS = 250;
 const DEBUG_PRICING = process.env.DEBUG_PRICING === "true";
+
+/** @param {string} requestId */
+export function trace(requestId, tag, message, data) {
+  const payload =
+    data !== undefined
+      ? { requestId, message, ...data }
+      : { requestId, message };
+  console.log(`[${tag}]`, JSON.stringify(payload));
+}
+
+/** @param {string} requestId */
+export function traceError(requestId, message, data) {
+  trace(requestId, "ERROR", message, data);
+}
+
+export { createPricingRequestId };
 
 function pricingLog(label, data) {
   if (!DEBUG_PRICING) return;
@@ -65,7 +83,8 @@ export function validatePricingInput(input) {
   };
 }
 
-export async function fetchShopPricingRates(admin) {
+export async function fetchShopPricingRates(admin, options = {}) {
+  const requestId = options.requestId;
   const response = await admin.graphql(
     `#graphql
       query getShopPricingRates {
@@ -86,9 +105,19 @@ export async function fetchShopPricingRates(admin) {
   );
 
   const responseJson = await response.json();
+  if (requestId) {
+    logGraphqlErrors(requestId, "fetchShopPricingRates", responseJson);
+  }
+
   const shop = responseJson?.data?.shop;
 
   if (!shop?.id) {
+    if (requestId) {
+      traceError(requestId, "Unable to fetch shop details for pricing", {
+        step: "fetchShopPricingRates",
+        responseJson,
+      });
+    }
     throw new Error("Unable to fetch shop details for pricing.");
   }
 
@@ -102,10 +131,52 @@ export async function fetchShopPricingRates(admin) {
   };
 }
 
-export async function saveShopPricingRates(admin, rates) {
-  const { shopId } = await fetchShopPricingRates(admin);
+/**
+ * @param {string} requestId
+ * @param {unknown} responseJson
+ */
+function logGraphqlErrors(requestId, context, responseJson) {
+  const errors = responseJson?.errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    traceError(requestId, `GraphQL errors (${context})`, {
+      step: context,
+      errors,
+    });
+  }
+}
 
-  // Assumption: these shop-level pricing values are stored as decimal metafields.
+export async function saveShopPricingRates(admin, rates, options = {}) {
+  const requestId = options.requestId ?? createPricingRequestId();
+
+  trace(requestId, "DATA", "saveShopPricingRates: fetching shop pricing metafields", {
+    source: "Shopify Admin GraphQL (shop metafields, namespace pricing)",
+  });
+
+  const { shopId, rates: existingRates } = await fetchShopPricingRates(admin, {
+    requestId,
+  });
+
+  const fetched = {
+    goldRate: existingRates.goldRate === "" ? null : existingRates.goldRate,
+    silverRate: existingRates.silverRate === "" ? null : existingRates.silverRate,
+    gst: existingRates.gst === "" ? null : existingRates.gst,
+  };
+  trace(requestId, "DATA", "Fetched existing shop rate metafields (before save)", {
+    fetched,
+  });
+  if (
+    fetched.goldRate == null &&
+    fetched.silverRate == null &&
+    fetched.gst == null
+  ) {
+    trace(
+      requestId,
+      "DATA",
+      "NOTE: all pricing metafields were empty on shop (first save or unset)",
+      {},
+    );
+  }
+
   const metafields = [
     {
       ownerId: shopId,
@@ -130,6 +201,14 @@ export async function saveShopPricingRates(admin, rates) {
     },
   ];
 
+  trace(requestId, "DATA", "Writing validated rates to shop metafields (metafieldsSet)", {
+    payload: {
+      goldRate: rates.goldRate,
+      silverRate: rates.silverRate,
+      gst: rates.gst,
+    },
+  });
+
   const response = await admin.graphql(
     `#graphql
       mutation setPricingMetafields($metafields: [MetafieldsSetInput!]!) {
@@ -151,18 +230,29 @@ export async function saveShopPricingRates(admin, rates) {
   );
 
   const responseJson = await response.json();
+  logGraphqlErrors(requestId, "metafieldsSet", responseJson);
+
   const userErrors = responseJson?.data?.metafieldsSet?.userErrors ?? [];
 
   if (userErrors.length > 0) {
+    traceError(requestId, "saveShopPricingRates: metafieldsSet userErrors", {
+      step: "saveShopPricingRates",
+      userErrors,
+      responseJson,
+    });
     throw new Error(
       `Failed to save pricing rates: ${userErrors
         .map((error) => error.message)
         .join(", ")}`,
     );
   }
+
+  trace(requestId, "DATA", "Shop pricing metafields saved successfully", {
+    metafields: responseJson?.data?.metafieldsSet?.metafields ?? [],
+  });
 }
 
-function calculateFinalPrice({ metalType, weight, makingCharges, rates }) {
+function getPriceBreakdown({ metalType, weight, makingCharges, rates }) {
   const normalizedType = String(metalType || "").toLowerCase();
   const metalRate =
     normalizedType === "gold"
@@ -176,8 +266,27 @@ function calculateFinalPrice({ metalType, weight, makingCharges, rates }) {
   }
 
   const subtotal = weight * metalRate + makingCharges;
-  const finalPrice = subtotal + (subtotal * rates.gst) / 100;
-  return roundToTwo(finalPrice);
+  const finalPrice = roundToTwo(subtotal + (subtotal * rates.gst) / 100);
+  const formula = `final = round(subtotal + subtotal * gst/100, 2) where subtotal = weight * metalRate + makingCharges`;
+  const formulaWithValues = `subtotal=${weight}*${metalRate}+${makingCharges}=${subtotal}; final=round(${subtotal}+${subtotal}*${rates.gst}/100,2)=${finalPrice}`;
+  return {
+    normalizedType,
+    metalRate,
+    subtotal,
+    finalPrice,
+    formula,
+    formulaWithValues,
+  };
+}
+
+function calculateFinalPrice({ metalType, weight, makingCharges, rates }) {
+  const breakdown = getPriceBreakdown({
+    metalType,
+    weight,
+    makingCharges,
+    rates,
+  });
+  return breakdown ? breakdown.finalPrice : null;
 }
 
 async function fetchProductPage(admin, afterCursor) {
@@ -191,6 +300,7 @@ async function fetchProductPage(admin, afterCursor) {
             node {
               id
               title
+              handle
               variants(first: 50) {
                 edges {
                   node {
@@ -231,10 +341,20 @@ async function fetchProductPage(admin, afterCursor) {
   return response.json();
 }
 
-async function updateProductVariantsPrice(admin, productId, variantUpdates) {
+async function updateProductVariantsPrice(
+  admin,
+  productId,
+  variantUpdates,
+  requestId,
+) {
   if (variantUpdates.length === 0) {
     return { success: false, reason: "NO_VARIANTS" };
   }
+
+  trace(requestId, "UPDATE", "productVariantsBulkUpdate (request)", {
+    productId,
+    variantUpdates: variantUpdates.map((v) => ({ id: v.id, price: v.price })),
+  });
 
   const response = await admin.graphql(
     `#graphql
@@ -262,25 +382,60 @@ async function updateProductVariantsPrice(admin, productId, variantUpdates) {
   );
 
   const responseJson = await response.json();
+  logGraphqlErrors(requestId, "productVariantsBulkUpdate", responseJson);
+
   const userErrors =
     responseJson?.data?.productVariantsBulkUpdate?.userErrors ?? [];
 
   if (userErrors.length > 0) {
+    traceError(requestId, "productVariantsBulkUpdate failed", {
+      step: "updateProductVariantsPrice",
+      productId,
+      userErrors,
+      responseJson,
+    });
     return {
       success: false,
       reason: userErrors.map((error) => error.message).join(", "),
+      responseJson,
     };
   }
+
+  trace(requestId, "UPDATE", "productVariantsBulkUpdate (success)", {
+    productId,
+    returnedProductId:
+      responseJson?.data?.productVariantsBulkUpdate?.product?.id ?? null,
+  });
 
   return { success: true };
 }
 
-export async function recalculateAllProductPrices(admin, rates) {
+export async function recalculateAllProductPrices(admin, rates, options = {}) {
+  const requestId = options.requestId ?? createPricingRequestId();
+
   const numericRates = {
     goldRate: Number(rates.goldRate),
     silverRate: Number(rates.silverRate),
     gst: Number(rates.gst),
   };
+
+  trace(requestId, "DATA", "Recalculation rates source: validated request payload (not re-read from metafields)", {
+    goldRate: numericRates.goldRate,
+    silverRate: numericRates.silverRate,
+    gst: numericRates.gst,
+  });
+
+  if (
+    !Number.isFinite(numericRates.goldRate) ||
+    !Number.isFinite(numericRates.silverRate) ||
+    !Number.isFinite(numericRates.gst)
+  ) {
+    traceError(requestId, "Invalid numeric rates after coercion", {
+      step: "recalculateAllProductPrices",
+      numericRates,
+    });
+    throw new Error("Invalid pricing rates for recalculation.");
+  }
 
   let hasNextPage = true;
   let afterCursor = null;
@@ -289,177 +444,285 @@ export async function recalculateAllProductPrices(admin, rates) {
   let skipped = 0;
   let failed = 0;
   const failures = [];
+  let pageIndex = 0;
 
-  while (hasNextPage) {
-    const pageResponse = await fetchProductPage(admin, afterCursor);
-    const products = pageResponse?.data?.products;
+  try {
+    while (hasNextPage) {
+      const pageResponse = await fetchProductPage(admin, afterCursor);
+      logGraphqlErrors(requestId, `fetchProductPage page ${pageIndex}`, pageResponse);
 
-    if (!products) {
-      throw new Error("Failed to fetch products for pricing recalculation.");
-    }
+      const products = pageResponse?.data?.products;
 
-    const productEdges = products.edges ?? [];
+      if (!products) {
+        traceError(requestId, "Failed to fetch products for pricing recalculation", {
+          step: "fetchProductPage",
+          pageIndex,
+          afterCursor,
+          responseJson: pageResponse,
+        });
+        throw new Error("Failed to fetch products for pricing recalculation.");
+      }
 
-    for (let index = 0; index < productEdges.length; index += UPDATE_BATCH_SIZE) {
-      const batch = productEdges.slice(index, index + UPDATE_BATCH_SIZE);
+      const productEdges = products.edges ?? [];
 
-      const batchResults = await Promise.all(
-        batch.map(async ({ node }) => {
-          processed += 1;
+      trace(requestId, "PRODUCT", "Product page fetched", {
+        pageIndex,
+        countOnPage: productEdges.length,
+        hasNextPage: Boolean(products.pageInfo?.hasNextPage),
+        sample: productEdges.slice(0, 5).map(({ node }) => ({
+          id: node.id,
+          handle: node.handle,
+          title: node.title,
+        })),
+      });
 
-          pricingLog("product_input", {
-            productId: node.id,
-            title: node.title,
-            variantCount: node.variants?.edges?.length ?? 0,
-            rates: numericRates,
-          });
+      if (productEdges.length === 0 && pageIndex === 0) {
+        traceError(requestId, "No products returned from Shopify", {
+          step: "fetchProductPage",
+        });
+      }
 
-          const variantEdges = node.variants?.edges ?? [];
-          const variantUpdates = [];
+      for (
+        let index = 0;
+        index < productEdges.length;
+        index += UPDATE_BATCH_SIZE
+      ) {
+        const batch = productEdges.slice(index, index + UPDATE_BATCH_SIZE);
 
-          for (const edge of variantEdges) {
-            const variantNode = edge.node;
-            const metalType = variantNode.metalType?.value ?? "";
-            const weight = Number(variantNode.weight?.value);
-            const makingCharges = Number(variantNode.makingCharges?.value);
+        const batchResults = await Promise.all(
+          batch.map(async ({ node }) => {
+            processed += 1;
 
-            pricingLog("variant_input", {
+            pricingLog("product_input", {
               productId: node.id,
-              productTitle: node.title,
-              variantId: variantNode.id,
-              variantTitle: variantNode.title ?? "",
-              raw: {
-                metalType: variantNode.metalType?.value ?? null,
-                weight: variantNode.weight?.value ?? null,
-                makingCharges: variantNode.makingCharges?.value ?? null,
-              },
-              parsed: {
-                metalType,
-                weight,
-                makingCharges,
-              },
-            });
-
-            if (!metalType) {
-              pricingLog("skip_variant_missing_metal_type", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? "",
-              });
-              continue;
-            }
-
-            if (!Number.isFinite(weight) || weight <= 0) {
-              pricingLog("skip_variant_invalid_weight", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? "",
-                rawWeight: variantNode.weight?.value ?? null,
-                parsedWeight: weight,
-              });
-              continue;
-            }
-
-            if (!Number.isFinite(makingCharges) || makingCharges < 0) {
-              pricingLog("skip_variant_invalid_making_charges", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? "",
-                rawMakingCharges: variantNode.makingCharges?.value ?? null,
-                parsedMakingCharges: makingCharges,
-              });
-              continue;
-            }
-
-            const calculatedPrice = calculateFinalPrice({
-              metalType,
-              weight,
-              makingCharges,
+              title: node.title,
+              variantCount: node.variants?.edges?.length ?? 0,
               rates: numericRates,
             });
 
-            if (calculatedPrice === null) {
-              pricingLog("skip_variant_unknown_metal_type", {
+            trace(requestId, "PRODUCT", "Processing product", {
+              productId: node.id,
+              title: node.title,
+              handle: node.handle,
+              variantCount: node.variants?.edges?.length ?? 0,
+            });
+
+            const variantEdges = node.variants?.edges ?? [];
+            const variantUpdates = [];
+
+            for (const edge of variantEdges) {
+              const variantNode = edge.node;
+              const metalType = variantNode.metalType?.value ?? "";
+              const weight = Number(variantNode.weight?.value);
+              const makingCharges = Number(variantNode.makingCharges?.value);
+
+              pricingLog("variant_input", {
                 productId: node.id,
                 productTitle: node.title,
                 variantId: variantNode.id,
                 variantTitle: variantNode.title ?? "",
-                metalType,
-                normalizedType: String(metalType || "").toLowerCase(),
-                expected: ["gold", "silver"],
+                raw: {
+                  metalType: variantNode.metalType?.value ?? null,
+                  weight: variantNode.weight?.value ?? null,
+                  makingCharges: variantNode.makingCharges?.value ?? null,
+                },
+                parsed: {
+                  metalType,
+                  weight,
+                  makingCharges,
+                },
               });
-              continue;
+
+              if (!metalType) {
+                trace(requestId, "CALCULATION", "Skipped: No metal type", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                });
+                pricingLog("skip_variant_missing_metal_type", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? "",
+                });
+                continue;
+              }
+
+              if (!Number.isFinite(weight) || weight <= 0) {
+                trace(requestId, "CALCULATION", "Skipped: Missing weight", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  rawWeight: variantNode.weight?.value ?? null,
+                  parsedWeight: weight,
+                });
+                pricingLog("skip_variant_invalid_weight", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? "",
+                  rawWeight: variantNode.weight?.value ?? null,
+                  parsedWeight: weight,
+                });
+                continue;
+              }
+
+              if (!Number.isFinite(makingCharges) || makingCharges < 0) {
+                trace(requestId, "CALCULATION", "Skipped: Invalid metafield", {
+                  reason: "making_charges invalid or negative",
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  rawMakingCharges: variantNode.makingCharges?.value ?? null,
+                });
+                pricingLog("skip_variant_invalid_making_charges", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? "",
+                  rawMakingCharges: variantNode.makingCharges?.value ?? null,
+                  parsedMakingCharges: makingCharges,
+                });
+                continue;
+              }
+
+              const calculatedPrice = calculateFinalPrice({
+                metalType,
+                weight,
+                makingCharges,
+                rates: numericRates,
+              });
+
+              if (calculatedPrice === null) {
+                trace(requestId, "CALCULATION", "Skipped: Invalid metafield", {
+                  detail: "metal_type must be gold or silver",
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  metalType,
+                });
+                pricingLog("skip_variant_unknown_metal_type", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? "",
+                  metalType,
+                  normalizedType: String(metalType || "").toLowerCase(),
+                  expected: ["gold", "silver"],
+                });
+                continue;
+              }
+
+              const breakdown = getPriceBreakdown({
+                metalType,
+                weight,
+                makingCharges,
+                rates: numericRates,
+              });
+
+              trace(requestId, "CALCULATION", "Variant priced", {
+                productId: node.id,
+                productTitle: node.title,
+                variantId: variantNode.id,
+                baseSubtotal: breakdown?.subtotal,
+                appliedFormula: breakdown?.formula,
+                formulaWithValues: breakdown?.formulaWithValues,
+                newPrice: calculatedPrice,
+              });
+
+              variantUpdates.push({
+                id: variantNode.id,
+                price: calculatedPrice.toFixed(2),
+              });
             }
 
-            variantUpdates.push({
-              id: variantNode.id,
-              price: calculatedPrice.toFixed(2),
-            });
-          }
+            if (variantUpdates.length === 0) {
+              trace(requestId, "CALCULATION", "Skipped: No valid variants for product", {
+                productId: node.id,
+                productTitle: node.title,
+                variantCount: variantEdges.length,
+              });
+              pricingLog("skip_product_no_valid_variants", {
+                productId: node.id,
+                productTitle: node.title,
+                variantCount: variantEdges.length,
+              });
+              return { status: "skipped" };
+            }
 
-          if (variantUpdates.length === 0) {
-            pricingLog("skip_product_no_valid_variants", {
-              productId: node.id,
-              productTitle: node.title,
-              variantCount: variantEdges.length,
-            });
-            return { status: "skipped" };
-          }
+            const updateResult = await updateProductVariantsPrice(
+              admin,
+              node.id,
+              variantUpdates,
+              requestId,
+            );
 
-          const updateResult = await updateProductVariantsPrice(
-            admin,
-            node.id,
-            variantUpdates,
-          );
+            if (!updateResult.success) {
+              pricingLog("update_failed", {
+                productId: node.id,
+                title: node.title,
+                reason: updateResult.reason,
+              });
+              return {
+                status: "failed",
+                message: `${node.title}: ${updateResult.reason}`,
+              };
+            }
 
-          if (!updateResult.success) {
-            pricingLog("update_failed", {
+            pricingLog("updated", {
               productId: node.id,
               title: node.title,
-              reason: updateResult.reason,
+              variantCount: variantUpdates.length,
             });
-            return {
-              status: "failed",
-              message: `${node.title}: ${updateResult.reason}`,
-            };
+
+            return { status: "updated" };
+          }),
+        );
+
+        for (const result of batchResults) {
+          if (result.status === "updated") {
+            updated += 1;
+          } else if (result.status === "skipped") {
+            skipped += 1;
+          } else {
+            failed += 1;
+            failures.push(result.message);
           }
-
-          pricingLog("updated", {
-            productId: node.id,
-            title: node.title,
-            variantCount: variantUpdates.length,
-          });
-
-          return { status: "updated" };
-        }),
-      );
-
-      for (const result of batchResults) {
-        if (result.status === "updated") {
-          updated += 1;
-        } else if (result.status === "skipped") {
-          skipped += 1;
-        } else {
-          failed += 1;
-          failures.push(result.message);
         }
+
+        await sleep(BATCH_DELAY_MS);
       }
 
-      await sleep(BATCH_DELAY_MS);
+      hasNextPage = Boolean(products.pageInfo?.hasNextPage);
+      afterCursor = products.pageInfo?.endCursor ?? null;
+      pageIndex += 1;
     }
 
-    hasNextPage = Boolean(products.pageInfo?.hasNextPage);
-    afterCursor = products.pageInfo?.endCursor ?? null;
-  }
+    console.log(`[SUMMARY] requestId=${requestId}`);
+    console.log(
+      `Processed: ${processed}\nUpdated: ${updated}\nSkipped: ${skipped}\nFailed: ${failed}`,
+    );
+    trace(requestId, "SUMMARY", "Recalculation complete", {
+      processed,
+      updated,
+      skipped,
+      failed,
+    });
 
-  return {
-    processed,
-    updated,
-    skipped,
-    failed,
-    failures: failures.slice(0, 10),
-  };
+    return {
+      processed,
+      updated,
+      skipped,
+      failed,
+      failures: failures.slice(0, 10),
+      requestId,
+    };
+  } catch (error) {
+    traceError(requestId, "recalculateAllProductPrices threw", {
+      step: "recalculateAllProductPrices",
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
+  }
 }

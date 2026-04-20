@@ -7,8 +7,11 @@ import {
   fetchShopPricingRates,
   recalculateAllProductPrices,
   saveShopPricingRates,
+  trace,
+  traceError,
   validatePricingInput,
 } from "../services/pricing.server";
+import { createPricingRequestId } from "../utils/pricingRequestId.js";
 
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
@@ -18,42 +21,88 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
 
+  const requestIdRaw = formData.get("requestId");
+  const requestIdFromForm =
+    typeof requestIdRaw === "string" ? requestIdRaw.trim() : "";
+  const requestId =
+    requestIdFromForm.length > 0 ? requestIdFromForm : createPricingRequestId();
+
+  const url = new URL(request.url);
   const formValues = {
     goldRate: String(formData.get("goldRate") ?? ""),
     silverRate: String(formData.get("silverRate") ?? ""),
     gst: String(formData.get("gst") ?? ""),
   };
 
+  trace(requestId, "API", "Pricing action invoked", {
+    route: "routes/app.pricing",
+    path: url.pathname,
+    method: request.method,
+    shop: session?.shop ?? null,
+    body: formValues,
+  });
+
   const validation = validatePricingInput(formValues);
 
   if (!validation.isValid) {
+    trace(requestId, "API", "Validation failed; skipping save and recalculation", {
+      fieldErrors: validation.errors,
+    });
     return {
       status: "error",
       message: "Please fix the highlighted fields and try again.",
       fieldErrors: validation.errors,
       values: formValues,
+      requestId,
     };
   }
 
   try {
-    await saveShopPricingRates(admin, validation.values);
-    const summary = await recalculateAllProductPrices(admin, validation.values);
+    try {
+      await saveShopPricingRates(admin, validation.values, { requestId });
+    } catch (error) {
+      traceError(requestId, "saveShopPricingRates failed", {
+        step: "saveShopPricingRates",
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error;
+    }
 
-    return {
-      status: "success",
-      message: "Pricing rates saved and product prices recalculated.",
-      fieldErrors: {},
-      values: {
-        goldRate: String(validation.values.goldRate),
-        silverRate: String(validation.values.silverRate),
-        gst: String(validation.values.gst),
-      },
-      summary,
-    };
+    try {
+      const summary = await recalculateAllProductPrices(admin, validation.values, {
+        requestId,
+      });
+
+      return {
+        status: "success",
+        message: "Pricing rates saved and product prices recalculated.",
+        fieldErrors: {},
+        values: {
+          goldRate: String(validation.values.goldRate),
+          silverRate: String(validation.values.silverRate),
+          gst: String(validation.values.gst),
+        },
+        summary,
+        requestId,
+      };
+    } catch (error) {
+      traceError(requestId, "recalculateAllProductPrices failed", {
+        step: "recalculateAllProductPrices",
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error;
+    }
   } catch (error) {
+    traceError(requestId, "Pricing action failed", {
+      step: "action",
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     return {
       status: "error",
       message:
@@ -62,6 +111,7 @@ export const action = async ({ request }) => {
           : "Failed to save pricing settings. Please try again.",
       fieldErrors: {},
       values: formValues,
+      requestId,
     };
   }
 };
@@ -88,7 +138,36 @@ export default function PricingRoute() {
 
   return (
     <s-page heading="Dynamic Pricing">
-      <Form method="post">
+      <Form
+        method="post"
+        onSubmit={(event) => {
+          const form = event.currentTarget;
+          const id = createPricingRequestId();
+          const hidden = form.elements.namedItem("requestId");
+          if (hidden && "value" in hidden) {
+            hidden.value = id;
+          }
+
+          const fd = new FormData(form);
+          const payload = {
+            goldRate: fd.get("goldRate"),
+            silverRate: fd.get("silverRate"),
+            gst: fd.get("gst"),
+            requestId: fd.get("requestId"),
+          };
+
+          console.log(
+            "[FRONTEND]",
+            JSON.stringify({
+              message: "Change Pricing Triggered",
+              timestamp: new Date().toISOString(),
+              payload,
+            }),
+          );
+        }}
+      >
+        <input type="hidden" name="requestId" defaultValue="" />
+
         <s-section heading="Metal Rates and GST">
           <s-stack direction="block" gap="base">
             <s-text-field
@@ -149,6 +228,11 @@ export default function PricingRoute() {
         <s-section heading="Last recalculation result">
           {actionData?.summary ? (
             <s-stack direction="block" gap="small">
+              {actionData.requestId ? (
+                <s-text as="p" tone="subdued">
+                  Request ID: {actionData.requestId}
+                </s-text>
+              ) : null}
               <s-text as="p">Processed: {actionData.summary.processed}</s-text>
               <s-text as="p">Updated: {actionData.summary.updated}</s-text>
               <s-text as="p">Skipped: {actionData.summary.skipped}</s-text>

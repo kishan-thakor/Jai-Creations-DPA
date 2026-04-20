@@ -397,6 +397,11 @@ const route7 = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProper
   __proto__: null,
   default: app_additional
 }, Symbol.toStringTag, { value: "Module" }));
+function createPricingRequestId() {
+  const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  const suffix = String(Math.floor(Math.random() * 900) + 100);
+  return `pricing-${date}-${suffix}`;
+}
 const SHOP_PRICING_NAMESPACE = "pricing";
 const PRODUCT_METAFIELD_NAMESPACE = "custom";
 const SHOP_METAFIELD_KEYS = {
@@ -408,6 +413,13 @@ const PRODUCTS_PAGE_SIZE = 50;
 const UPDATE_BATCH_SIZE = 25;
 const BATCH_DELAY_MS = 250;
 const DEBUG_PRICING = process.env.DEBUG_PRICING === "true";
+function trace(requestId, tag, message, data) {
+  const payload = data !== void 0 ? { requestId, message, ...data } : { requestId, message };
+  console.log(`[${tag}]`, JSON.stringify(payload));
+}
+function traceError(requestId, message, data) {
+  trace(requestId, "ERROR", message, data);
+}
 function pricingLog(label2, data) {
   if (!DEBUG_PRICING) return;
   console.log(`[pricing] ${label2}`, JSON.stringify(data, null, 2));
@@ -450,8 +462,9 @@ function validatePricingInput(input2) {
     isValid: Object.keys(errors).length === 0
   };
 }
-async function fetchShopPricingRates(admin) {
+async function fetchShopPricingRates(admin, options = {}) {
   var _a2, _b, _c, _d;
+  const requestId = options.requestId;
   const response = await admin.graphql(
     `#graphql
       query getShopPricingRates {
@@ -471,8 +484,17 @@ async function fetchShopPricingRates(admin) {
     `
   );
   const responseJson = await response.json();
+  if (requestId) {
+    logGraphqlErrors(requestId, "fetchShopPricingRates", responseJson);
+  }
   const shop = (_a2 = responseJson == null ? void 0 : responseJson.data) == null ? void 0 : _a2.shop;
   if (!(shop == null ? void 0 : shop.id)) {
+    if (requestId) {
+      traceError(requestId, "Unable to fetch shop details for pricing", {
+        step: "fetchShopPricingRates",
+        responseJson
+      });
+    }
     throw new Error("Unable to fetch shop details for pricing.");
   }
   return {
@@ -484,9 +506,40 @@ async function fetchShopPricingRates(admin) {
     }
   };
 }
-async function saveShopPricingRates(admin, rates) {
-  var _a2, _b;
-  const { shopId } = await fetchShopPricingRates(admin);
+function logGraphqlErrors(requestId, context, responseJson) {
+  const errors = responseJson == null ? void 0 : responseJson.errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    traceError(requestId, `GraphQL errors (${context})`, {
+      step: context,
+      errors
+    });
+  }
+}
+async function saveShopPricingRates(admin, rates, options = {}) {
+  var _a2, _b, _c, _d;
+  const requestId = options.requestId ?? createPricingRequestId();
+  trace(requestId, "DATA", "saveShopPricingRates: fetching shop pricing metafields", {
+    source: "Shopify Admin GraphQL (shop metafields, namespace pricing)"
+  });
+  const { shopId, rates: existingRates } = await fetchShopPricingRates(admin, {
+    requestId
+  });
+  const fetched = {
+    goldRate: existingRates.goldRate === "" ? null : existingRates.goldRate,
+    silverRate: existingRates.silverRate === "" ? null : existingRates.silverRate,
+    gst: existingRates.gst === "" ? null : existingRates.gst
+  };
+  trace(requestId, "DATA", "Fetched existing shop rate metafields (before save)", {
+    fetched
+  });
+  if (fetched.goldRate == null && fetched.silverRate == null && fetched.gst == null) {
+    trace(
+      requestId,
+      "DATA",
+      "NOTE: all pricing metafields were empty on shop (first save or unset)",
+      {}
+    );
+  }
   const metafields = [
     {
       ownerId: shopId,
@@ -510,6 +563,13 @@ async function saveShopPricingRates(admin, rates) {
       value: String(rates.gst)
     }
   ];
+  trace(requestId, "DATA", "Writing validated rates to shop metafields (metafieldsSet)", {
+    payload: {
+      goldRate: rates.goldRate,
+      silverRate: rates.silverRate,
+      gst: rates.gst
+    }
+  });
   const response = await admin.graphql(
     `#graphql
       mutation setPricingMetafields($metafields: [MetafieldsSetInput!]!) {
@@ -530,22 +590,49 @@ async function saveShopPricingRates(admin, rates) {
     { variables: { metafields } }
   );
   const responseJson = await response.json();
+  logGraphqlErrors(requestId, "metafieldsSet", responseJson);
   const userErrors = ((_b = (_a2 = responseJson == null ? void 0 : responseJson.data) == null ? void 0 : _a2.metafieldsSet) == null ? void 0 : _b.userErrors) ?? [];
   if (userErrors.length > 0) {
+    traceError(requestId, "saveShopPricingRates: metafieldsSet userErrors", {
+      step: "saveShopPricingRates",
+      userErrors,
+      responseJson
+    });
     throw new Error(
       `Failed to save pricing rates: ${userErrors.map((error) => error.message).join(", ")}`
     );
   }
+  trace(requestId, "DATA", "Shop pricing metafields saved successfully", {
+    metafields: ((_d = (_c = responseJson == null ? void 0 : responseJson.data) == null ? void 0 : _c.metafieldsSet) == null ? void 0 : _d.metafields) ?? []
+  });
 }
-function calculateFinalPrice({ metalType, weight, makingCharges, rates }) {
+function getPriceBreakdown({ metalType, weight, makingCharges, rates }) {
   const normalizedType = String(metalType || "").toLowerCase();
   const metalRate = normalizedType === "gold" ? rates.goldRate : normalizedType === "silver" ? rates.silverRate : null;
   if (!metalRate) {
     return null;
   }
   const subtotal = weight * metalRate + makingCharges;
-  const finalPrice = subtotal + subtotal * rates.gst / 100;
-  return roundToTwo(finalPrice);
+  const finalPrice = roundToTwo(subtotal + subtotal * rates.gst / 100);
+  const formula = `final = round(subtotal + subtotal * gst/100, 2) where subtotal = weight * metalRate + makingCharges`;
+  const formulaWithValues = `subtotal=${weight}*${metalRate}+${makingCharges}=${subtotal}; final=round(${subtotal}+${subtotal}*${rates.gst}/100,2)=${finalPrice}`;
+  return {
+    normalizedType,
+    metalRate,
+    subtotal,
+    finalPrice,
+    formula,
+    formulaWithValues
+  };
+}
+function calculateFinalPrice({ metalType, weight, makingCharges, rates }) {
+  const breakdown = getPriceBreakdown({
+    metalType,
+    weight,
+    makingCharges,
+    rates
+  });
+  return breakdown ? breakdown.finalPrice : null;
 }
 async function fetchProductPage(admin, afterCursor) {
   const ns = PRODUCT_METAFIELD_NAMESPACE;
@@ -558,6 +645,7 @@ async function fetchProductPage(admin, afterCursor) {
             node {
               id
               title
+              handle
               variants(first: 50) {
                 edges {
                   node {
@@ -596,11 +684,15 @@ async function fetchProductPage(admin, afterCursor) {
   );
   return response.json();
 }
-async function updateProductVariantsPrice(admin, productId, variantUpdates) {
-  var _a2, _b;
+async function updateProductVariantsPrice(admin, productId, variantUpdates, requestId) {
+  var _a2, _b, _c, _d, _e;
   if (variantUpdates.length === 0) {
     return { success: false, reason: "NO_VARIANTS" };
   }
+  trace(requestId, "UPDATE", "productVariantsBulkUpdate (request)", {
+    productId,
+    variantUpdates: variantUpdates.map((v) => ({ id: v.id, price: v.price }))
+  });
   const response = await admin.graphql(
     `#graphql
       mutation updateProductVariantPrices(
@@ -626,22 +718,47 @@ async function updateProductVariantsPrice(admin, productId, variantUpdates) {
     }
   );
   const responseJson = await response.json();
+  logGraphqlErrors(requestId, "productVariantsBulkUpdate", responseJson);
   const userErrors = ((_b = (_a2 = responseJson == null ? void 0 : responseJson.data) == null ? void 0 : _a2.productVariantsBulkUpdate) == null ? void 0 : _b.userErrors) ?? [];
   if (userErrors.length > 0) {
+    traceError(requestId, "productVariantsBulkUpdate failed", {
+      step: "updateProductVariantsPrice",
+      productId,
+      userErrors,
+      responseJson
+    });
     return {
       success: false,
-      reason: userErrors.map((error) => error.message).join(", ")
+      reason: userErrors.map((error) => error.message).join(", "),
+      responseJson
     };
   }
+  trace(requestId, "UPDATE", "productVariantsBulkUpdate (success)", {
+    productId,
+    returnedProductId: ((_e = (_d = (_c = responseJson == null ? void 0 : responseJson.data) == null ? void 0 : _c.productVariantsBulkUpdate) == null ? void 0 : _d.product) == null ? void 0 : _e.id) ?? null
+  });
   return { success: true };
 }
-async function recalculateAllProductPrices(admin, rates) {
-  var _a2, _b, _c;
+async function recalculateAllProductPrices(admin, rates, options = {}) {
+  var _a2, _b, _c, _d;
+  const requestId = options.requestId ?? createPricingRequestId();
   const numericRates = {
     goldRate: Number(rates.goldRate),
     silverRate: Number(rates.silverRate),
     gst: Number(rates.gst)
   };
+  trace(requestId, "DATA", "Recalculation rates source: validated request payload (not re-read from metafields)", {
+    goldRate: numericRates.goldRate,
+    silverRate: numericRates.silverRate,
+    gst: numericRates.gst
+  });
+  if (!Number.isFinite(numericRates.goldRate) || !Number.isFinite(numericRates.silverRate) || !Number.isFinite(numericRates.gst)) {
+    traceError(requestId, "Invalid numeric rates after coercion", {
+      step: "recalculateAllProductPrices",
+      numericRates
+    });
+    throw new Error("Invalid pricing rates for recalculation.");
+  }
   let hasNextPage = true;
   let afterCursor = null;
   let processed = 0;
@@ -649,156 +766,256 @@ async function recalculateAllProductPrices(admin, rates) {
   let skipped = 0;
   let failed = 0;
   const failures = [];
-  while (hasNextPage) {
-    const pageResponse = await fetchProductPage(admin, afterCursor);
-    const products = (_a2 = pageResponse == null ? void 0 : pageResponse.data) == null ? void 0 : _a2.products;
-    if (!products) {
-      throw new Error("Failed to fetch products for pricing recalculation.");
-    }
-    const productEdges = products.edges ?? [];
-    for (let index2 = 0; index2 < productEdges.length; index2 += UPDATE_BATCH_SIZE) {
-      const batch = productEdges.slice(index2, index2 + UPDATE_BATCH_SIZE);
-      const batchResults = await Promise.all(
-        batch.map(async ({ node }) => {
-          var _a3, _b2, _c2, _d, _e, _f, _g, _h, _i, _j, _k;
-          processed += 1;
-          pricingLog("product_input", {
-            productId: node.id,
-            title: node.title,
-            variantCount: ((_b2 = (_a3 = node.variants) == null ? void 0 : _a3.edges) == null ? void 0 : _b2.length) ?? 0,
-            rates: numericRates
-          });
-          const variantEdges = ((_c2 = node.variants) == null ? void 0 : _c2.edges) ?? [];
-          const variantUpdates = [];
-          for (const edge of variantEdges) {
-            const variantNode = edge.node;
-            const metalType = ((_d = variantNode.metalType) == null ? void 0 : _d.value) ?? "";
-            const weight = Number((_e = variantNode.weight) == null ? void 0 : _e.value);
-            const makingCharges = Number((_f = variantNode.makingCharges) == null ? void 0 : _f.value);
-            pricingLog("variant_input", {
-              productId: node.id,
-              productTitle: node.title,
-              variantId: variantNode.id,
-              variantTitle: variantNode.title ?? "",
-              raw: {
-                metalType: ((_g = variantNode.metalType) == null ? void 0 : _g.value) ?? null,
-                weight: ((_h = variantNode.weight) == null ? void 0 : _h.value) ?? null,
-                makingCharges: ((_i = variantNode.makingCharges) == null ? void 0 : _i.value) ?? null
-              },
-              parsed: {
-                metalType,
-                weight,
-                makingCharges
-              }
-            });
-            if (!metalType) {
-              pricingLog("skip_variant_missing_metal_type", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? ""
-              });
-              continue;
-            }
-            if (!Number.isFinite(weight) || weight <= 0) {
-              pricingLog("skip_variant_invalid_weight", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? "",
-                rawWeight: ((_j = variantNode.weight) == null ? void 0 : _j.value) ?? null,
-                parsedWeight: weight
-              });
-              continue;
-            }
-            if (!Number.isFinite(makingCharges) || makingCharges < 0) {
-              pricingLog("skip_variant_invalid_making_charges", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? "",
-                rawMakingCharges: ((_k = variantNode.makingCharges) == null ? void 0 : _k.value) ?? null,
-                parsedMakingCharges: makingCharges
-              });
-              continue;
-            }
-            const calculatedPrice = calculateFinalPrice({
-              metalType,
-              weight,
-              makingCharges,
-              rates: numericRates
-            });
-            if (calculatedPrice === null) {
-              pricingLog("skip_variant_unknown_metal_type", {
-                productId: node.id,
-                productTitle: node.title,
-                variantId: variantNode.id,
-                variantTitle: variantNode.title ?? "",
-                metalType,
-                normalizedType: String(metalType || "").toLowerCase(),
-                expected: ["gold", "silver"]
-              });
-              continue;
-            }
-            variantUpdates.push({
-              id: variantNode.id,
-              price: calculatedPrice.toFixed(2)
-            });
-          }
-          if (variantUpdates.length === 0) {
-            pricingLog("skip_product_no_valid_variants", {
-              productId: node.id,
-              productTitle: node.title,
-              variantCount: variantEdges.length
-            });
-            return { status: "skipped" };
-          }
-          const updateResult = await updateProductVariantsPrice(
-            admin,
-            node.id,
-            variantUpdates
-          );
-          if (!updateResult.success) {
-            pricingLog("update_failed", {
+  let pageIndex = 0;
+  try {
+    while (hasNextPage) {
+      const pageResponse = await fetchProductPage(admin, afterCursor);
+      logGraphqlErrors(requestId, `fetchProductPage page ${pageIndex}`, pageResponse);
+      const products = (_a2 = pageResponse == null ? void 0 : pageResponse.data) == null ? void 0 : _a2.products;
+      if (!products) {
+        traceError(requestId, "Failed to fetch products for pricing recalculation", {
+          step: "fetchProductPage",
+          pageIndex,
+          afterCursor,
+          responseJson: pageResponse
+        });
+        throw new Error("Failed to fetch products for pricing recalculation.");
+      }
+      const productEdges = products.edges ?? [];
+      trace(requestId, "PRODUCT", "Product page fetched", {
+        pageIndex,
+        countOnPage: productEdges.length,
+        hasNextPage: Boolean((_b = products.pageInfo) == null ? void 0 : _b.hasNextPage),
+        sample: productEdges.slice(0, 5).map(({ node }) => ({
+          id: node.id,
+          handle: node.handle,
+          title: node.title
+        }))
+      });
+      if (productEdges.length === 0 && pageIndex === 0) {
+        traceError(requestId, "No products returned from Shopify", {
+          step: "fetchProductPage"
+        });
+      }
+      for (let index2 = 0; index2 < productEdges.length; index2 += UPDATE_BATCH_SIZE) {
+        const batch = productEdges.slice(index2, index2 + UPDATE_BATCH_SIZE);
+        const batchResults = await Promise.all(
+          batch.map(async ({ node }) => {
+            var _a3, _b2, _c2, _d2, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o;
+            processed += 1;
+            pricingLog("product_input", {
               productId: node.id,
               title: node.title,
-              reason: updateResult.reason
+              variantCount: ((_b2 = (_a3 = node.variants) == null ? void 0 : _a3.edges) == null ? void 0 : _b2.length) ?? 0,
+              rates: numericRates
             });
-            return {
-              status: "failed",
-              message: `${node.title}: ${updateResult.reason}`
-            };
+            trace(requestId, "PRODUCT", "Processing product", {
+              productId: node.id,
+              title: node.title,
+              handle: node.handle,
+              variantCount: ((_d2 = (_c2 = node.variants) == null ? void 0 : _c2.edges) == null ? void 0 : _d2.length) ?? 0
+            });
+            const variantEdges = ((_e = node.variants) == null ? void 0 : _e.edges) ?? [];
+            const variantUpdates = [];
+            for (const edge of variantEdges) {
+              const variantNode = edge.node;
+              const metalType = ((_f = variantNode.metalType) == null ? void 0 : _f.value) ?? "";
+              const weight = Number((_g = variantNode.weight) == null ? void 0 : _g.value);
+              const makingCharges = Number((_h = variantNode.makingCharges) == null ? void 0 : _h.value);
+              pricingLog("variant_input", {
+                productId: node.id,
+                productTitle: node.title,
+                variantId: variantNode.id,
+                variantTitle: variantNode.title ?? "",
+                raw: {
+                  metalType: ((_i = variantNode.metalType) == null ? void 0 : _i.value) ?? null,
+                  weight: ((_j = variantNode.weight) == null ? void 0 : _j.value) ?? null,
+                  makingCharges: ((_k = variantNode.makingCharges) == null ? void 0 : _k.value) ?? null
+                },
+                parsed: {
+                  metalType,
+                  weight,
+                  makingCharges
+                }
+              });
+              if (!metalType) {
+                trace(requestId, "CALCULATION", "Skipped: No metal type", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id
+                });
+                pricingLog("skip_variant_missing_metal_type", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? ""
+                });
+                continue;
+              }
+              if (!Number.isFinite(weight) || weight <= 0) {
+                trace(requestId, "CALCULATION", "Skipped: Missing weight", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  rawWeight: ((_l = variantNode.weight) == null ? void 0 : _l.value) ?? null,
+                  parsedWeight: weight
+                });
+                pricingLog("skip_variant_invalid_weight", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? "",
+                  rawWeight: ((_m = variantNode.weight) == null ? void 0 : _m.value) ?? null,
+                  parsedWeight: weight
+                });
+                continue;
+              }
+              if (!Number.isFinite(makingCharges) || makingCharges < 0) {
+                trace(requestId, "CALCULATION", "Skipped: Invalid metafield", {
+                  reason: "making_charges invalid or negative",
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  rawMakingCharges: ((_n = variantNode.makingCharges) == null ? void 0 : _n.value) ?? null
+                });
+                pricingLog("skip_variant_invalid_making_charges", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? "",
+                  rawMakingCharges: ((_o = variantNode.makingCharges) == null ? void 0 : _o.value) ?? null,
+                  parsedMakingCharges: makingCharges
+                });
+                continue;
+              }
+              const calculatedPrice = calculateFinalPrice({
+                metalType,
+                weight,
+                makingCharges,
+                rates: numericRates
+              });
+              if (calculatedPrice === null) {
+                trace(requestId, "CALCULATION", "Skipped: Invalid metafield", {
+                  detail: "metal_type must be gold or silver",
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  metalType
+                });
+                pricingLog("skip_variant_unknown_metal_type", {
+                  productId: node.id,
+                  productTitle: node.title,
+                  variantId: variantNode.id,
+                  variantTitle: variantNode.title ?? "",
+                  metalType,
+                  normalizedType: String(metalType || "").toLowerCase(),
+                  expected: ["gold", "silver"]
+                });
+                continue;
+              }
+              const breakdown = getPriceBreakdown({
+                metalType,
+                weight,
+                makingCharges,
+                rates: numericRates
+              });
+              trace(requestId, "CALCULATION", "Variant priced", {
+                productId: node.id,
+                productTitle: node.title,
+                variantId: variantNode.id,
+                baseSubtotal: breakdown == null ? void 0 : breakdown.subtotal,
+                appliedFormula: breakdown == null ? void 0 : breakdown.formula,
+                formulaWithValues: breakdown == null ? void 0 : breakdown.formulaWithValues,
+                newPrice: calculatedPrice
+              });
+              variantUpdates.push({
+                id: variantNode.id,
+                price: calculatedPrice.toFixed(2)
+              });
+            }
+            if (variantUpdates.length === 0) {
+              trace(requestId, "CALCULATION", "Skipped: No valid variants for product", {
+                productId: node.id,
+                productTitle: node.title,
+                variantCount: variantEdges.length
+              });
+              pricingLog("skip_product_no_valid_variants", {
+                productId: node.id,
+                productTitle: node.title,
+                variantCount: variantEdges.length
+              });
+              return { status: "skipped" };
+            }
+            const updateResult = await updateProductVariantsPrice(
+              admin,
+              node.id,
+              variantUpdates,
+              requestId
+            );
+            if (!updateResult.success) {
+              pricingLog("update_failed", {
+                productId: node.id,
+                title: node.title,
+                reason: updateResult.reason
+              });
+              return {
+                status: "failed",
+                message: `${node.title}: ${updateResult.reason}`
+              };
+            }
+            pricingLog("updated", {
+              productId: node.id,
+              title: node.title,
+              variantCount: variantUpdates.length
+            });
+            return { status: "updated" };
+          })
+        );
+        for (const result of batchResults) {
+          if (result.status === "updated") {
+            updated += 1;
+          } else if (result.status === "skipped") {
+            skipped += 1;
+          } else {
+            failed += 1;
+            failures.push(result.message);
           }
-          pricingLog("updated", {
-            productId: node.id,
-            title: node.title,
-            variantCount: variantUpdates.length
-          });
-          return { status: "updated" };
-        })
-      );
-      for (const result of batchResults) {
-        if (result.status === "updated") {
-          updated += 1;
-        } else if (result.status === "skipped") {
-          skipped += 1;
-        } else {
-          failed += 1;
-          failures.push(result.message);
         }
+        await sleep(BATCH_DELAY_MS);
       }
-      await sleep(BATCH_DELAY_MS);
+      hasNextPage = Boolean((_c = products.pageInfo) == null ? void 0 : _c.hasNextPage);
+      afterCursor = ((_d = products.pageInfo) == null ? void 0 : _d.endCursor) ?? null;
+      pageIndex += 1;
     }
-    hasNextPage = Boolean((_b = products.pageInfo) == null ? void 0 : _b.hasNextPage);
-    afterCursor = ((_c = products.pageInfo) == null ? void 0 : _c.endCursor) ?? null;
+    console.log(`[SUMMARY] requestId=${requestId}`);
+    console.log(
+      `Processed: ${processed}
+Updated: ${updated}
+Skipped: ${skipped}
+Failed: ${failed}`
+    );
+    trace(requestId, "SUMMARY", "Recalculation complete", {
+      processed,
+      updated,
+      skipped,
+      failed
+    });
+    return {
+      processed,
+      updated,
+      skipped,
+      failed,
+      failures: failures.slice(0, 10),
+      requestId
+    };
+  } catch (error) {
+    traceError(requestId, "recalculateAllProductPrices threw", {
+      step: "recalculateAllProductPrices",
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : void 0
+    });
+    throw error;
   }
-  return {
-    processed,
-    updated,
-    skipped,
-    failed,
-    failures: failures.slice(0, 10)
-  };
 }
 const loader$1 = async ({
   request
@@ -817,43 +1034,88 @@ const action$1 = async ({
   request
 }) => {
   const {
-    admin
+    admin,
+    session
   } = await authenticate.admin(request);
   const formData = await request.formData();
+  const requestIdRaw = formData.get("requestId");
+  const requestIdFromForm = typeof requestIdRaw === "string" ? requestIdRaw.trim() : "";
+  const requestId = requestIdFromForm.length > 0 ? requestIdFromForm : createPricingRequestId();
+  const url = new URL(request.url);
   const formValues = {
     goldRate: String(formData.get("goldRate") ?? ""),
     silverRate: String(formData.get("silverRate") ?? ""),
     gst: String(formData.get("gst") ?? "")
   };
+  trace(requestId, "API", "Pricing action invoked", {
+    route: "routes/app.pricing",
+    path: url.pathname,
+    method: request.method,
+    shop: (session == null ? void 0 : session.shop) ?? null,
+    body: formValues
+  });
   const validation = validatePricingInput(formValues);
   if (!validation.isValid) {
+    trace(requestId, "API", "Validation failed; skipping save and recalculation", {
+      fieldErrors: validation.errors
+    });
     return {
       status: "error",
       message: "Please fix the highlighted fields and try again.",
       fieldErrors: validation.errors,
-      values: formValues
+      values: formValues,
+      requestId
     };
   }
   try {
-    await saveShopPricingRates(admin, validation.values);
-    const summary = await recalculateAllProductPrices(admin, validation.values);
-    return {
-      status: "success",
-      message: "Pricing rates saved and product prices recalculated.",
-      fieldErrors: {},
-      values: {
-        goldRate: String(validation.values.goldRate),
-        silverRate: String(validation.values.silverRate),
-        gst: String(validation.values.gst)
-      },
-      summary
-    };
+    try {
+      await saveShopPricingRates(admin, validation.values, {
+        requestId
+      });
+    } catch (error) {
+      traceError(requestId, "saveShopPricingRates failed", {
+        step: "saveShopPricingRates",
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : void 0
+      });
+      throw error;
+    }
+    try {
+      const summary = await recalculateAllProductPrices(admin, validation.values, {
+        requestId
+      });
+      return {
+        status: "success",
+        message: "Pricing rates saved and product prices recalculated.",
+        fieldErrors: {},
+        values: {
+          goldRate: String(validation.values.goldRate),
+          silverRate: String(validation.values.silverRate),
+          gst: String(validation.values.gst)
+        },
+        summary,
+        requestId
+      };
+    } catch (error) {
+      traceError(requestId, "recalculateAllProductPrices failed", {
+        step: "recalculateAllProductPrices",
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : void 0
+      });
+      throw error;
+    }
   } catch (error) {
+    traceError(requestId, "Pricing action failed", {
+      step: "action",
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : void 0
+    });
     return {
       status: "error",
       message: error instanceof Error ? error.message : "Failed to save pricing settings. Please try again.",
       fieldErrors: {},
-      values: formValues
+      values: formValues,
+      requestId
     };
   }
 };
@@ -879,7 +1141,31 @@ const app_pricing = UNSAFE_withComponentProps(function PricingRoute() {
     heading: "Dynamic Pricing",
     children: /* @__PURE__ */ jsxs(Form, {
       method: "post",
-      children: [/* @__PURE__ */ jsx("s-section", {
+      onSubmit: (event) => {
+        const form2 = event.currentTarget;
+        const id = createPricingRequestId();
+        const hidden = form2.elements.namedItem("requestId");
+        if (hidden && "value" in hidden) {
+          hidden.value = id;
+        }
+        const fd = new FormData(form2);
+        const payload = {
+          goldRate: fd.get("goldRate"),
+          silverRate: fd.get("silverRate"),
+          gst: fd.get("gst"),
+          requestId: fd.get("requestId")
+        };
+        console.log("[FRONTEND]", JSON.stringify({
+          message: "Change Pricing Triggered",
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          payload
+        }));
+      },
+      children: [/* @__PURE__ */ jsx("input", {
+        type: "hidden",
+        name: "requestId",
+        defaultValue: ""
+      }), /* @__PURE__ */ jsx("s-section", {
         heading: "Metal Rates and GST",
         children: /* @__PURE__ */ jsxs("s-stack", {
           direction: "block",
@@ -934,7 +1220,11 @@ const app_pricing = UNSAFE_withComponentProps(function PricingRoute() {
         children: (actionData == null ? void 0 : actionData.summary) ? /* @__PURE__ */ jsxs("s-stack", {
           direction: "block",
           gap: "small",
-          children: [/* @__PURE__ */ jsxs("s-text", {
+          children: [actionData.requestId ? /* @__PURE__ */ jsxs("s-text", {
+            as: "p",
+            tone: "subdued",
+            children: ["Request ID: ", actionData.requestId]
+          }) : null, /* @__PURE__ */ jsxs("s-text", {
             as: "p",
             children: ["Processed: ", actionData.summary.processed]
           }), /* @__PURE__ */ jsxs("s-text", {
@@ -1286,7 +1576,7 @@ const route9 = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProper
   headers,
   loader
 }, Symbol.toStringTag, { value: "Module" }));
-const serverManifest = { "entry": { "module": "/assets/entry.client-809PteFE.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js"], "css": [] }, "routes": { "root": { "id": "root", "parentId": void 0, "path": "", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/root-B-wyEiTI.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/webhooks.app.scopes_update": { "id": "routes/webhooks.app.scopes_update", "parentId": "root", "path": "webhooks/app/scopes_update", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": false, "hasErrorBoundary": false, "module": "/assets/webhooks.app.scopes_update-l0sNRNKZ.js", "imports": [], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/webhooks.app.uninstalled": { "id": "routes/webhooks.app.uninstalled", "parentId": "root", "path": "webhooks/app/uninstalled", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": false, "hasErrorBoundary": false, "module": "/assets/webhooks.app.uninstalled-l0sNRNKZ.js", "imports": [], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/auth.login": { "id": "routes/auth.login", "parentId": "root", "path": "auth/login", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/route-DtKBsl-W.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js", "/assets/AppProxyProvider-SrvWGCmb.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/_index": { "id": "routes/_index", "parentId": "root", "path": void 0, "index": true, "caseSensitive": void 0, "hasAction": false, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/route-DpvH8fWI.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js"], "css": ["/assets/route-Xpdx9QZl.css"], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/auth.$": { "id": "routes/auth.$", "parentId": "root", "path": "auth/*", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": false, "hasErrorBoundary": false, "module": "/assets/auth._-l0sNRNKZ.js", "imports": [], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app": { "id": "routes/app", "parentId": "root", "path": "app", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": true, "module": "/assets/app-B6a64Nte.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js", "/assets/AppProxyProvider-SrvWGCmb.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app.additional": { "id": "routes/app.additional", "parentId": "routes/app", "path": "additional", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/app.additional-D1zWOt48.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app.pricing": { "id": "routes/app.pricing", "parentId": "routes/app", "path": "pricing", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/app.pricing-CTMIWUCt.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js", "/assets/useAppBridge-Bj34gXAL.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app._index": { "id": "routes/app._index", "parentId": "routes/app", "path": void 0, "index": true, "caseSensitive": void 0, "hasAction": true, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/app._index-Bn9zXmUO.js", "imports": ["/assets/chunk-UVKPFVEO-CzY-NNDe.js", "/assets/useAppBridge-Bj34gXAL.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 } }, "url": "/assets/manifest-88a9e47b.js", "version": "88a9e47b", "sri": void 0 };
+const serverManifest = { "entry": { "module": "/assets/entry.client-CJk0MDyU.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js"], "css": [] }, "routes": { "root": { "id": "root", "parentId": void 0, "path": "", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/root-CDqzdkIw.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/webhooks.app.scopes_update": { "id": "routes/webhooks.app.scopes_update", "parentId": "root", "path": "webhooks/app/scopes_update", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": false, "hasErrorBoundary": false, "module": "/assets/webhooks.app.scopes_update-l0sNRNKZ.js", "imports": [], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/webhooks.app.uninstalled": { "id": "routes/webhooks.app.uninstalled", "parentId": "root", "path": "webhooks/app/uninstalled", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": false, "hasErrorBoundary": false, "module": "/assets/webhooks.app.uninstalled-l0sNRNKZ.js", "imports": [], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/auth.login": { "id": "routes/auth.login", "parentId": "root", "path": "auth/login", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/route-BdpFReNW.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js", "/assets/AppProxyProvider-D6H-7l2P.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/_index": { "id": "routes/_index", "parentId": "root", "path": void 0, "index": true, "caseSensitive": void 0, "hasAction": false, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/route-EKJjgdiO.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js"], "css": ["/assets/route-Xpdx9QZl.css"], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/auth.$": { "id": "routes/auth.$", "parentId": "root", "path": "auth/*", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": false, "hasErrorBoundary": false, "module": "/assets/auth._-l0sNRNKZ.js", "imports": [], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app": { "id": "routes/app", "parentId": "root", "path": "app", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": true, "module": "/assets/app-tmA5WCFc.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js", "/assets/AppProxyProvider-D6H-7l2P.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app.additional": { "id": "routes/app.additional", "parentId": "routes/app", "path": "additional", "index": void 0, "caseSensitive": void 0, "hasAction": false, "hasLoader": false, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/app.additional-CGU6oPok.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app.pricing": { "id": "routes/app.pricing", "parentId": "routes/app", "path": "pricing", "index": void 0, "caseSensitive": void 0, "hasAction": true, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/app.pricing-BsFNz3e9.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js", "/assets/useAppBridge-Bj34gXAL.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 }, "routes/app._index": { "id": "routes/app._index", "parentId": "routes/app", "path": void 0, "index": true, "caseSensitive": void 0, "hasAction": true, "hasLoader": true, "hasClientAction": false, "hasClientLoader": false, "hasClientMiddleware": false, "hasDefaultExport": true, "hasErrorBoundary": false, "module": "/assets/app._index-D6BBnH9f.js", "imports": ["/assets/chunk-UVKPFVEO-H-OZ_vkh.js", "/assets/useAppBridge-Bj34gXAL.js"], "css": [], "clientActionModule": void 0, "clientLoaderModule": void 0, "clientMiddlewareModule": void 0, "hydrateFallbackModule": void 0 } }, "url": "/assets/manifest-c9c6434d.js", "version": "c9c6434d", "sri": void 0 };
 const assetsBuildDirectory = "build/client";
 const basename = "/";
 const future = { "unstable_optimizeDeps": false, "unstable_passThroughRequests": false, "unstable_subResourceIntegrity": false, "unstable_trailingSlashAwareDataRequests": false, "unstable_previewServerPrerendering": false, "v8_middleware": false, "v8_splitRouteModules": false, "v8_viteEnvironmentApi": false };
